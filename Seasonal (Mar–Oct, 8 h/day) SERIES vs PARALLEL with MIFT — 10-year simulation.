@@ -1,0 +1,242 @@
+# -*- coding: utf-8 -*-
+"""
+Seasonal (Mar–Oct, 8 h/day) SERIES vs PARALLEL with MIFT — 10-year simulation.
+Outputs:
+  • Time-series plots (EWT & T_b only) for 2025 and 2034, Series & Parallel
+  • EWT vs Depth sweeps (equal branch flow, equal total flow)
+Requires: pygfunction >= 2.3.x
+"""
+
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import calendar, datetime as dt
+import pygfunction as gt
+
+# ---------------- Figure style ----------------
+mpl.rcParams['font.family'] = 'Times New Roman'
+mpl.rcParams['font.size'] = 12
+
+# ============================ User choices ============================
+TON          = 1.5                  # cooling tonnage
+EWT_CAP_C    = 35.0                  # EWT design cap (drawn on sweeps)
+START_HOUR   = 10                    # ON start (10:00)
+HOURS_ON     = 8                     # ON duration per day
+MONTHS_ON    = range(3, 11)          # Mar..Oct inclusive  (CHANGED)
+YEARS        = 10                    # simulate 2025..2034
+H_DEFAULT    = 55.0                  # depth used in time-series comparison [m]
+H_GRID       = np.arange(30.0, 150.0 + 1e-9, 5.0)  # sweep grid [m]
+YEAR0        = 2025                  # starting calendar year
+USE_LAST_SEASON_FOR_SWEEP = True     # fast sweeps (use 2034 season only)
+
+# Borefield layout
+N1, N2 = 2, 1                        # 4 bores in a row
+B      = 7.5                         # spacing [m]
+D      = 4.0                         # burial depth [m]
+r_b    = 0.1532/2                    # bore radius [m]
+
+# Ground / materials
+T_g, k_s, alpha = 25.0, 2.45, 1.0e-6
+k_g, k_p = 2.98, 0.70
+
+# Pipe / fluid
+r_out, r_in = 33.6e-3/2, 27.4e-3/2
+D_s = 0.11/2
+epsilon = 1e-6
+pos = [(-D_s, 0.0), (D_s, 0.0)]
+m_flow_bore_base = 0.30              # branch mass flow per bore [kg/s]
+fluid = gt.media.Fluid('Water', 30.0)
+cp_f, rho_f, mu_f, k_f = fluid.cp, fluid.rho, fluid.mu, fluid.k
+
+# Time grid (hourly)
+dt_sec = 3600.0
+
+# g-function options
+OPTS_SERIES   = {'nSegments': 8, 'disp': False}
+OPTS_PARALLEL = {'nSegments': 8, 'disp': False}
+
+# ============================== Helpers ===============================
+def build_year_schedule(year, months_on, start_hour, on_hours, Q_on):
+    hours = (366 if calendar.isleap(year) else 365) * 24
+    Q = np.zeros(hours)
+    t0 = dt.datetime(year, 1, 1)
+    for m in months_on:
+        days = calendar.monthrange(year, m)[1]
+        for d in range(1, days + 1):
+            for h in range(start_hour, start_hour + on_hours):
+                hh = h % 24
+                idx = int((dt.datetime(year, m, d, hh) - t0).total_seconds() // 3600)
+                if 0 <= idx < hours:
+                    Q[idx] = Q_on
+    return Q
+
+def build_multi_year_schedule(year0, years, months_on, start_hour, on_hours, Q_on):
+    Q_years = []; year_offsets = [0]
+    for i in range(years):
+        y = year0 + i
+        Qy = build_year_schedule(y, months_on, start_hour, on_hours, Q_on)
+        Q_years.append(Qy)
+        year_offsets.append(year_offsets[-1] + Qy.size)
+    Q_series = np.concatenate(Q_years)
+    return Q_series, np.array(year_offsets[:-1])  # starts of years 0..years-1
+
+def pipe_resistance(m_flow_branch):
+    R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+    h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow_branch, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+    )
+    R_f = 1.0 / (h_f * 2 * np.pi * r_in)
+    return R_p + R_f
+
+def make_network(H, topology, m_flow_branch):
+    borefield = gt.boreholes.rectangle_field(N1, N2, B, B, H, D, r_b)
+    nB = len(borefield)
+    Rtube = pipe_resistance(m_flow_branch)
+    UTubes = [gt.pipes.SingleUTube(pos, r_in, r_out, bh, k_s, k_g, Rtube) for bh in borefield]
+    if topology == 'series':
+        conn = [i - 1 for i in range(nB)]   # chain
+        m_flow_network = m_flow_branch
+    elif topology == 'parallel':
+        conn = [-1] * nB                     # common headers
+        m_flow_network = m_flow_branch * nB
+    else:
+        raise ValueError("topology must be 'series' or 'parallel'")
+    net = gt.networks.Network(borefield, UTubes, bore_connectivity=conn)
+    H_tot = sum(b.H for b in borefield)
+    return net, m_flow_network, H_tot
+
+def simulate(topology, H, Q_series, m_flow_branch):
+    net, m_flow_net, H_tot = make_network(H, topology, m_flow_branch)
+    Nt = len(Q_series)
+    time = dt_sec * (np.arange(Nt) + 1)
+
+    LoadAgg = gt.load_aggregation.ClaessonJaved(dt_sec, time[-1])
+    gFunc = gt.gfunction.gFunction(
+        net, alpha,
+        time=LoadAgg.get_times_for_simulation(),
+        m_flow_network=m_flow_net, cp_f=cp_f,
+        boundary_condition='MIFT',
+        options=(OPTS_SERIES if topology == 'series' else OPTS_PARALLEL),
+        method='equivalent'  # robust
+    )
+    LoadAgg.initialize(gFunc.gFunc / (2 * np.pi * k_s))
+
+    T_b  = np.zeros(Nt)
+    T_in = np.zeros(Nt)
+    T_out = np.zeros(Nt)
+
+    for t, Q in zip(time, Q_series):
+        LoadAgg.next_time_step(t)
+        LoadAgg.set_current_load(Q / H_tot)   # W/m
+        dT = LoadAgg.temporal_superposition()
+        Tb = T_g - dT
+        T_b[ int(t/dt_sec) - 1 ] = Tb
+        Tin  = net.get_network_inlet_temperature(Q, Tb, m_flow_net, cp_f, nSegments=3)
+        T_in[ int(t/dt_sec) - 1 ] = Tin
+        T_out[int(t/dt_sec) - 1 ] = net.get_network_outlet_temperature(Tin, Tb, m_flow_net, cp_f, nSegments=3)
+    return time, T_b, T_in, T_out
+
+def sweep_peak_ewt(topology, H_grid, Q_series, m_flow_branch):
+    peaks = np.empty_like(H_grid, dtype=float)
+    for i, H in enumerate(H_grid):
+        print(f"[{topology}] H = {H:.1f} m ({i+1}/{len(H_grid)})")
+        _, _, _, Tout = simulate(topology, H, Q_series, m_flow_branch)
+        peaks[i] = np.nanmax(Tout)
+    return peaks
+
+def season_slice_for_year(index_in_0_to_years_minus_1, Q_series, year_offsets):
+    y0 = year_offsets[index_in_0_to_years_minus_1]
+    y1 = year_offsets[index_in_0_to_years_minus_1 + 1] if index_in_0_to_years_minus_1 + 1 < len(year_offsets) \
+         else Q_series.size
+    Qy = Q_series[y0:y1]
+    if not np.any(Qy):
+        return slice(y0, y0)
+    start = y0 + np.argmax(Qy != 0)
+    stop  = y1 - np.argmax(Qy[::-1] != 0)
+    return slice(start, stop)
+
+# ========================== Seasonal schedule =========================
+Q_on = -1000.0 * 3.517 * TON  # W, cooling → inject (negative)
+Q_series, year_offsets = build_multi_year_schedule(
+    YEAR0, YEARS, MONTHS_ON, START_HOUR, HOURS_ON, Q_on
+)
+
+# -------------------------- Simulate once per topology ----------------
+print(f"[Schedule] Simulated years: {YEAR0}..{YEAR0+YEARS-1}")
+tS, TbS, TinS, ToutS = simulate('series',   H_DEFAULT, Q_series, m_flow_bore_base)
+tP, TbP, TinP, ToutP = simulate('parallel', H_DEFAULT, Q_series, m_flow_bore_base)
+
+# Slices for 2025 (index 0) and 2034 (index 9)
+sl_2025 = season_slice_for_year(0, Q_series, year_offsets)
+sl_2034 = season_slice_for_year(9, Q_series, year_offsets)
+hrs_2025 = np.arange(sl_2025.start, sl_2025.stop) - sl_2025.start
+hrs_2034 = np.arange(sl_2034.start, sl_2034.stop) - sl_2034.start
+
+# -------- Peak metrics (per season) --------
+def peak_metrics(Tout, Tin, Tb, sl):
+    subEWT = Tout[sl]
+    subLWT = Tin[sl]
+    subTb  = Tb[sl]
+    # indices (hours since season start) where peaks occur
+    iE = int(np.nanargmax(subEWT)) if subEWT.size else 0
+    iL = int(np.nanargmax(subLWT)) if subLWT.size else 0
+    iB = int(np.nanargmax(subTb))  if subTb.size  else 0
+    return {
+        "peak_EWT": float(np.nanmax(subEWT)) if subEWT.size else np.nan,
+        "t_EWT_h":  iE,
+        "peak_LWT": float(np.nanmax(subLWT)) if subLWT.size else np.nan,
+        "t_LWT_h":  iL,
+        "peak_Tb":  float(np.nanmax(subTb))  if subTb.size  else np.nan,
+        "t_Tb_h":   iB,
+    }
+
+peaks_S_2025 = peak_metrics(ToutS, TinS, TbS, sl_2025)
+peaks_S_2034 = peak_metrics(ToutS, TinS, TbS, sl_2034)
+peaks_P_2025 = peak_metrics(ToutP, TinP, TbP, sl_2025)
+peaks_P_2034 = peak_metrics(ToutP, TinP, TbP, sl_2034)
+
+# Console summary table
+print("\nPeak temperatures (seasonal):")
+print("Case                | Year | Peak EWT [°C] | Peak LWT [°C] | Peak Tb [°C]")
+print("--------------------+------+---------------+---------------+-------------")
+print(f"Series              | 2025 | {peaks_S_2025['peak_EWT']:.2f}         | {peaks_S_2025['peak_LWT']:.2f}         | {peaks_S_2025['peak_Tb']:.2f}")
+print(f"Series              | 2034 | {peaks_S_2034['peak_EWT']:.2f}         | {peaks_S_2034['peak_LWT']:.2f}         | {peaks_S_2034['peak_Tb']:.2f}")
+print(f"Parallel            | 2025 | {peaks_P_2025['peak_EWT']:.2f}         | {peaks_P_2025['peak_LWT']:.2f}         | {peaks_P_2025['peak_Tb']:.2f}")
+print(f"Parallel            | 2034 | {peaks_P_2034['peak_EWT']:.2f}         | {peaks_P_2034['peak_LWT']:.2f}         | {peaks_P_2034['peak_Tb']:.2f}")
+
+# ------------------------- Clean time-series plots --------------------
+def plot_ts(ax, hours, EWT, Tb, title, peaks=None):
+    ax.plot(hours, EWT, lw=1.6, label="EWT")
+    ax.plot(hours, Tb,  lw=1.3, label=r"$T_b$")
+    ax.set_xlabel("Hours since season start")
+    ax.set_ylabel("Temperature [°C]")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, loc="best")
+    # Annotate peaks (including LWT even if not plotted)
+    if peaks is not None:
+        text = (f"Peak EWT: {peaks['peak_EWT']:.2f} °C\n"
+                f"Peak LWT: {peaks['peak_LWT']:.2f} °C\n"
+                f"Peak $T_b$: {peaks['peak_Tb']:.2f} °C")
+        ax.text(0.02, 0.98, text, transform=ax.transAxes,
+                va='top', ha='left', fontsize=11,
+                bbox=dict(boxstyle='round,pad=0.3',
+                          facecolor='white', alpha=0.75, edgecolor='0.8'))
+
+# SERIES: 2025 & 2034
+fig, axes = plt.subplots(1, 2, figsize=(12,4.5), constrained_layout=True)
+plot_ts(axes[0], hrs_2025, ToutS[sl_2025], TbS[sl_2025],
+        f"Series — 2025 (H={H_DEFAULT:.0f} m)", peaks_S_2025)
+plot_ts(axes[1], hrs_2034, ToutS[sl_2034], TbS[sl_2034],
+        f"Series — 2034 (H={H_DEFAULT:.0f} m)", peaks_S_2034)
+plt.savefig(' Seasonal peak EWT [°C] vs time 2025_55m .tiff', format='tiff')
+plt.show()
+
+# PARALLEL: 2025 & 2034
+fig, axes = plt.subplots(1, 2, figsize=(12,4.5), constrained_layout=True)
+plot_ts(axes[0], hrs_2025, ToutP[sl_2025], TbP[sl_2025],
+        f"Parallel — 2025 (H={H_DEFAULT:.0f} m)", peaks_P_2025)
+plot_ts(axes[1], hrs_2034, ToutP[sl_2034], TbP[sl_2034],
+        f"Parallel — 2034 (H={H_DEFAULT:.0f} m)", peaks_P_2034)
+plt.savefig(' Seasonal peak EWT [°C] vs time 2034_55m .tiff', format='tiff')
+plt.show()
